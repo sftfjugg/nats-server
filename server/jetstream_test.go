@@ -8706,10 +8706,12 @@ func TestJetStreamMsgHeaders(t *testing.T) {
 			if mset.store == nil {
 				t.Fatal("Store is not ready")
 			}
+			state := mset.state()
+
+			t.Logf("Fast State: %+v", state)
 			result := mset.store.State()
 			t.Logf("Slow State: %+v", result)
 
-			state := mset.state()
 			if state.Msgs != 1 {
 				t.Fatalf("Expected 1 message, got %d", state.Msgs)
 			}
