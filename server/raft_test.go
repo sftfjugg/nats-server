@@ -14,6 +14,7 @@
 package server
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -140,15 +141,56 @@ func TestNRGAppendEntryDecode(t *testing.T) {
 }
 
 func TestRaftChain(t *testing.T) {
+	const numBlocks = 5
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
 
 	rg := c.createRaftGroup("TEST", 3, newRaftChainStateMachine)
 	rg.waitOnLeader()
-	// Do several state transitions.
-	rg.randomMember().(*raftChainStateMachine).proposeBlock("foo")
-	rg.randomMember().(*raftChainStateMachine).proposeBlock("bar")
-	rg.randomMember().(*raftChainStateMachine).proposeBlock("baz")
 
-	time.Sleep(10 * time.Second)
+	for iteration := 1; iteration <= 10; iteration++ {
+		// Do several state transitions.
+		for i := 0; i < numBlocks; i++ {
+			rg.randomMember().(*raftChainStateMachine).proposeBlock()
+		}
+
+		// Wait on participants to converge
+		checkFor(t, 20*time.Second, 500*time.Millisecond, func() error {
+			expectedBlocks := uint64(iteration * numBlocks)
+			var otherNode, otherNodeHash string
+			for i, sm := range rg {
+				stateMachine := sm.(*raftChainStateMachine)
+				blocksCount, currentHash := stateMachine.getCurrentHash()
+				name := fmt.Sprintf(
+					"%s/%s",
+					stateMachine.server().Name(),
+					stateMachine.node().ID(),
+				)
+				if blocksCount != expectedBlocks {
+					return fmt.Errorf(
+						"node %s has applied %d/%d blocks",
+						name,
+						blocksCount,
+						expectedBlocks,
+					)
+				}
+				// Block count matches expected, check hash
+				if i == 0 {
+					// Save first for comparison
+					otherNode = name
+					otherNodeHash = currentHash
+				} else if currentHash != otherNodeHash {
+					return fmt.Errorf(
+						"node %s hash: %q different from node %s hash: %q",
+						name,
+						currentHash,
+						otherNode,
+						otherNodeHash,
+					)
+				}
+			}
+			fmt.Printf("✅ %d nodes converged on hash %s after %d blocks\n", 3, otherNodeHash, expectedBlocks)
+			return nil
+		})
+	}
 }

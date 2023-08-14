@@ -18,7 +18,10 @@ package server
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"hash"
+	"hash/crc32"
 	"math/rand"
 	"sync"
 	"testing"
@@ -279,10 +282,20 @@ func newStateAdder(s *Server, cfg *RaftConfig, n RaftNode) stateMachine {
 // Hash chain of values delivered via RAFT
 type raftChainStateMachine struct {
 	sync.Mutex
-	s      *Server
-	n      RaftNode
-	cfg    *RaftConfig
-	leader bool
+	s                *Server
+	n                RaftNode
+	cfg              *RaftConfig
+	leader           bool
+	proposalSequence uint64
+	rng              *rand.Rand
+	hash             hash.Hash
+	blocksApplied    uint64
+}
+
+type ChainBlock struct {
+	Proposer         string
+	ProposerSequence uint64
+	Data             []byte
 }
 
 func (sm *raftChainStateMachine) server() *Server {
@@ -309,10 +322,10 @@ func (sm *raftChainStateMachine) applyEntry(ce *CommittedEntry) {
 		// Nothing to apply
 		return
 	}
-	fmt.Printf("[%s] Apply committed entry %d (%d entries)\n", sm.s.Name(), ce.Index, len(ce.Entries))
+	fmt.Printf("[%s] Apply entries #%d (%d entries)\n", sm.s.Name(), ce.Index, len(ce.Entries))
 	for i, entry := range ce.Entries {
 		if entry.Type == EntryNormal {
-			fmt.Printf("[%s] Apply sub-entry (%d of %d): %q\n", sm.s.Name(), i+1, len(ce.Entries), entry.Data)
+			sm.applyBlock(entry.Data)
 		} else if entry.Type == EntrySnapshot {
 			fmt.Printf("[%s] Applying snapshot sub-entry (%d/%d): %q\n", sm.s.Name(), i+1, len(ce.Entries), entry.Data)
 		} else {
@@ -366,11 +379,55 @@ func (sm *raftChainStateMachine) restart() {
 	go smLoop(sm)
 }
 
-func (sm *raftChainStateMachine) proposeBlock(s string) {
-	sm.propose([]byte(s))
+func (sm *raftChainStateMachine) proposeBlock() {
+	sm.proposalSequence += 1
+	block := ChainBlock{
+		Proposer:         sm.s.Name(),
+		ProposerSequence: sm.proposalSequence,
+		Data:             make([]byte, sm.rng.Intn(20)+1),
+	}
+	sm.rng.Read(block.Data)
+	blockData, err := json.Marshal(block)
+	if err != nil {
+		panic(fmt.Sprintf("serialization error: %s", err))
+	}
+	sm.propose(blockData)
+}
+
+func (sm *raftChainStateMachine) applyBlock(data []byte) {
+	var block ChainBlock
+	err := json.Unmarshal(data, &block)
+	if err != nil {
+		panic(fmt.Sprintf("deserialization error: %s", err))
+	}
+	fmt.Printf("Applying block <%s, %d>\n", block.Proposer, block.ProposerSequence)
+	n, err := sm.hash.Write(block.Data)
+	if n != len(block.Data) {
+		panic(fmt.Sprintf("unexpected checksum written %d data block size: %d", n, len(block.Data)))
+	} else if err != nil {
+		panic(fmt.Sprintf("checksum error: %s", err))
+	}
+	sm.blocksApplied += 1
+	fmt.Printf("[%s] new checksum: %X\n", sm.s.Name(), sm.hash.Sum(nil))
+}
+
+func (sm *raftChainStateMachine) getCurrentHash() (uint64, string) {
+	sm.Lock()
+	defer sm.Unlock()
+	return sm.blocksApplied, fmt.Sprintf("%X", sm.hash.Sum(nil))
 }
 
 // Factory function.
 func newRaftChainStateMachine(s *Server, cfg *RaftConfig, n RaftNode) stateMachine {
-	return &raftChainStateMachine{s: s, n: n, cfg: cfg}
+	var seed int64
+	for _, c := range []byte(s.Name()) {
+		seed += int64(c)
+	}
+	for _, c := range []byte(n.ID()) {
+		seed += int64(c)
+	}
+	rng := rand.New(rand.NewSource(seed))
+	hash := crc32.NewIEEE()
+	fmt.Printf("Server: %q, ID: %q, Seed: %d\n", s.Name(), n.ID(), seed)
+	return &raftChainStateMachine{s: s, n: n, cfg: cfg, rng: rng, hash: hash}
 }
