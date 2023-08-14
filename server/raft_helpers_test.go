@@ -274,3 +274,103 @@ func (rg smGroup) waitOnTotal(t *testing.T, expected int64) {
 func newStateAdder(s *Server, cfg *RaftConfig, n RaftNode) stateMachine {
 	return &stateAdder{s: s, n: n, cfg: cfg}
 }
+
+// Simple implementation of a replicated state.
+// Hash chain of values delivered via RAFT
+type raftChainStateMachine struct {
+	sync.Mutex
+	s      *Server
+	n      RaftNode
+	cfg    *RaftConfig
+	leader bool
+}
+
+func (sm *raftChainStateMachine) server() *Server {
+	return sm.s
+}
+
+func (sm *raftChainStateMachine) node() RaftNode {
+	return sm.n
+}
+
+func (sm *raftChainStateMachine) propose(data []byte) {
+	sm.Lock()
+	defer sm.Unlock()
+	err := sm.n.ForwardProposal(data)
+	if err != nil {
+		panic(fmt.Sprintf("proposal error: %s", err))
+	}
+}
+
+func (sm *raftChainStateMachine) applyEntry(ce *CommittedEntry) {
+	sm.Lock()
+	defer sm.Unlock()
+	if ce == nil {
+		// Nothing to apply
+		return
+	}
+	fmt.Printf("[%s] Apply committed entry %d (%d entries)\n", sm.s.Name(), ce.Index, len(ce.Entries))
+	for i, entry := range ce.Entries {
+		if entry.Type == EntryNormal {
+			fmt.Printf("[%s] Apply sub-entry (%d of %d): %q\n", sm.s.Name(), i+1, len(ce.Entries), entry.Data)
+		} else if entry.Type == EntrySnapshot {
+			fmt.Printf("[%s] Applying snapshot sub-entry (%d/%d): %q\n", sm.s.Name(), i+1, len(ce.Entries), entry.Data)
+		} else {
+			panic(fmt.Sprintf("[%s] unknown entry type: %s", sm.s.Name(), entry.Type))
+		}
+	}
+	sm.n.Applied(ce.Index)
+}
+
+func (sm *raftChainStateMachine) leaderChange(isLeader bool) {
+	if sm.leader && !isLeader {
+		fmt.Printf("[%s] leader change: no longer leader\n", sm.s.Name())
+	} else if sm.leader && isLeader {
+		fmt.Printf("[%s] elected leader while already leader\n", sm.s.Name())
+	} else if !sm.leader && isLeader {
+		fmt.Printf("[%s] leader change: i am leader\n", sm.s.Name())
+	} else {
+		fmt.Printf("[%s] leader change\n", sm.s.Name())
+	}
+	sm.leader = isLeader
+}
+
+func (sm *raftChainStateMachine) stop() {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.n.Stop()
+}
+
+func (sm *raftChainStateMachine) restart() {
+	sm.Lock()
+	defer sm.Unlock()
+
+	if sm.n.State() != Closed {
+		return
+	}
+
+	// The filestore is stopped as well, so need to extract the parts to recreate it.
+	rn := sm.n.(*raft)
+	fs := rn.wal.(*fileStore)
+
+	var err error
+	sm.cfg.Log, err = newFileStore(fs.fcfg, fs.cfg.StreamConfig)
+	if err != nil {
+		panic(err)
+	}
+	sm.n, err = sm.s.startRaftNode(globalAccountName, sm.cfg)
+	if err != nil {
+		panic(err)
+	}
+	// Finally restart the driver.
+	go smLoop(sm)
+}
+
+func (sm *raftChainStateMachine) proposeBlock(s string) {
+	sm.propose([]byte(s))
+}
+
+// Factory function.
+func newRaftChainStateMachine(s *Server, cfg *RaftConfig, n RaftNode) stateMachine {
+	return &raftChainStateMachine{s: s, n: n, cfg: cfg}
+}

@@ -138,3 +138,17 @@ func TestNRGAppendEntryDecode(t *testing.T) {
 		}
 	}
 }
+
+func TestRaftChain(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newRaftChainStateMachine)
+	rg.waitOnLeader()
+	// Do several state transitions.
+	rg.randomMember().(*raftChainStateMachine).proposeBlock("foo")
+	rg.randomMember().(*raftChainStateMachine).proposeBlock("bar")
+	rg.randomMember().(*raftChainStateMachine).proposeBlock("baz")
+
+	time.Sleep(10 * time.Second)
+}
