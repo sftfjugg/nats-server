@@ -192,5 +192,101 @@ func TestRaftChain(t *testing.T) {
 			fmt.Printf("✅ %d nodes converged on hash %s after %d blocks\n", 3, otherNodeHash, expectedBlocks)
 			return nil
 		})
+
+		// Restart one of the participants
+		stateMachine := rg.randomMember()
+		stateMachine.stop()
+		stateMachine.restart()
+	}
+}
+
+func TestRaftChain2(t *testing.T) {
+	const numBlocks = 5
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newRaftChainStateMachine)
+	rg.waitOnLeader()
+
+	activeNodes := make([]stateMachine, 3)
+	stoppedNodes := make([]stateMachine, 3)
+	activeNodes[0] = rg[0]
+	activeNodes[1] = rg[1]
+	activeNodes[2] = rg[2]
+
+	rng := rand.New(rand.NewSource(12345))
+
+	type Operation int
+	const (
+		STOP Operation = iota
+		RESTART
+		SNAPSHOT
+		PROPOSE
+		PAUSE
+	)
+
+	probabilities := []Operation{
+		STOP,
+		RESTART,
+		RESTART,
+		RESTART,
+		SNAPSHOT,
+		SNAPSHOT,
+		PROPOSE,
+		PROPOSE,
+		PROPOSE,
+		PROPOSE,
+		PAUSE,
+		PAUSE,
+	}
+
+	for iteration := 0; iteration < 1000; iteration++ {
+		r := rng.Intn(len(probabilities))
+		switch probabilities[r] {
+		case STOP:
+			// Stop a node
+			i := rng.Intn(3)
+			if activeNodes[i] != nil {
+				stoppedNodes[i] = activeNodes[i]
+				activeNodes[i] = nil
+				stoppedNodes[i].stop()
+			}
+
+		case RESTART:
+			// Restart a stopped node
+			i := rng.Intn(3)
+			if stoppedNodes[i] != nil {
+				activeNodes[i] = stoppedNodes[i]
+				stoppedNodes[i] = nil
+				activeNodes[i].restart()
+			}
+		case SNAPSHOT:
+			// Take a snapshot
+			i := rng.Intn(3)
+			if activeNodes[i] != nil {
+				activeNodes[i].(*raftChainStateMachine).snapshot()
+			}
+		case PROPOSE:
+			// Propose a block
+			i := rng.Intn(3)
+			if activeNodes[i] != nil {
+				activeNodes[i].(*raftChainStateMachine).proposeBlock()
+			}
+		case PAUSE:
+			time.Sleep(time.Duration(rng.Intn(200)) * time.Millisecond)
+		}
+
+		fmt.Printf("___STATE___\n")
+		for i := 0; i < 3; i++ {
+			if activeNodes[i] != nil {
+				activeNode := activeNodes[i]
+				blocksCount, blockHash := activeNode.(*raftChainStateMachine).getCurrentHash()
+				fmt.Printf(" - %s: %s (%d blocks)\n", activeNode.server().Name(), blockHash, blocksCount)
+			} else {
+				stoppedNode := stoppedNodes[i]
+				fmt.Printf(" - %s: *stopped*\n", stoppedNode.server().Name())
+			}
+		}
+
 	}
 }

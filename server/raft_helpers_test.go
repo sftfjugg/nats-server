@@ -17,6 +17,7 @@
 package server
 
 import (
+	"encoding"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -282,14 +283,15 @@ func newStateAdder(s *Server, cfg *RaftConfig, n RaftNode) stateMachine {
 // Hash chain of values delivered via RAFT
 type raftChainStateMachine struct {
 	sync.Mutex
-	s                *Server
-	n                RaftNode
-	cfg              *RaftConfig
-	leader           bool
-	proposalSequence uint64
-	rng              *rand.Rand
-	hash             hash.Hash
-	blocksApplied    uint64
+	s                          *Server
+	n                          RaftNode
+	cfg                        *RaftConfig
+	leader                     bool
+	proposalSequence           uint64
+	rng                        *rand.Rand
+	hash                       hash.Hash
+	blocksApplied              uint64
+	blocksAppliedSinceSnapshot uint64
 }
 
 type ChainBlock struct {
@@ -323,11 +325,11 @@ func (sm *raftChainStateMachine) applyEntry(ce *CommittedEntry) {
 		return
 	}
 	fmt.Printf("[%s] Apply entries #%d (%d entries)\n", sm.s.Name(), ce.Index, len(ce.Entries))
-	for i, entry := range ce.Entries {
+	for _, entry := range ce.Entries {
 		if entry.Type == EntryNormal {
 			sm.applyBlock(entry.Data)
 		} else if entry.Type == EntrySnapshot {
-			fmt.Printf("[%s] Applying snapshot sub-entry (%d/%d): %q\n", sm.s.Name(), i+1, len(ce.Entries), entry.Data)
+			sm.loadSnapshot(entry.Data)
 		} else {
 			panic(fmt.Sprintf("[%s] unknown entry type: %s", sm.s.Name(), entry.Type))
 		}
@@ -352,11 +354,15 @@ func (sm *raftChainStateMachine) stop() {
 	sm.Lock()
 	defer sm.Unlock()
 	sm.n.Stop()
+	sm.blocksApplied = 0
+	sm.hash.Reset()
+	fmt.Printf("[%s] stopped\n", sm.s.Name())
 }
 
 func (sm *raftChainStateMachine) restart() {
 	sm.Lock()
 	defer sm.Unlock()
+	fmt.Printf("[%s] restarting\n", sm.s.Name())
 
 	if sm.n.State() != Closed {
 		return
@@ -391,6 +397,13 @@ func (sm *raftChainStateMachine) proposeBlock() {
 	if err != nil {
 		panic(fmt.Sprintf("serialization error: %s", err))
 	}
+	fmt.Printf(
+		"[%s] proposing block <%s, %d, [%dB]>\n",
+		sm.s.Name(),
+		block.Proposer,
+		block.ProposerSequence,
+		len(block.Data),
+	)
 	sm.propose(blockData)
 }
 
@@ -400,7 +413,7 @@ func (sm *raftChainStateMachine) applyBlock(data []byte) {
 	if err != nil {
 		panic(fmt.Sprintf("deserialization error: %s", err))
 	}
-	fmt.Printf("Applying block <%s, %d>\n", block.Proposer, block.ProposerSequence)
+	fmt.Printf("[%s] Applying block <%s, %d>\n", sm.s.Name(), block.Proposer, block.ProposerSequence)
 	n, err := sm.hash.Write(block.Data)
 	if n != len(block.Data) {
 		panic(fmt.Sprintf("unexpected checksum written %d data block size: %d", n, len(block.Data)))
@@ -408,13 +421,77 @@ func (sm *raftChainStateMachine) applyBlock(data []byte) {
 		panic(fmt.Sprintf("checksum error: %s", err))
 	}
 	sm.blocksApplied += 1
-	fmt.Printf("[%s] new checksum: %X\n", sm.s.Name(), sm.hash.Sum(nil))
+	sm.blocksAppliedSinceSnapshot += 1
+	fmt.Printf("[%s] new checksum: %X after %d blocks\n", sm.s.Name(), sm.hash.Sum(nil), sm.blocksApplied)
 }
 
 func (sm *raftChainStateMachine) getCurrentHash() (uint64, string) {
 	sm.Lock()
 	defer sm.Unlock()
 	return sm.blocksApplied, fmt.Sprintf("%X", sm.hash.Sum(nil))
+}
+
+type chainHashSnapshot struct {
+	SourceNode  string
+	HashData    []byte
+	BlocksCount uint64
+}
+
+func (sm *raftChainStateMachine) snapshot() {
+	sm.Lock()
+	defer sm.Unlock()
+
+	if sm.blocksAppliedSinceSnapshot == 0 {
+		fmt.Printf(
+			"[%s] skip snapshot, no new entries\n",
+			sm.s.Name(),
+		)
+		return
+	}
+
+	fmt.Printf(
+		"[%s] snapshot (with %d blocks applied)\n",
+		sm.s.Name(),
+		sm.blocksApplied,
+	)
+
+	serializedHash, err := sm.hash.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		panic(fmt.Sprintf("failed to marshal hash: %s", err))
+	}
+
+	snapshot := chainHashSnapshot{
+		SourceNode:  fmt.Sprintf("%s/%s", sm.s.Name(), sm.n.ID()),
+		HashData:    serializedHash,
+		BlocksCount: sm.blocksApplied,
+	}
+
+	snapshotData, err := json.Marshal(snapshot)
+	if err != nil {
+		panic(fmt.Sprintf("failed to marshal snapshot: %s", err))
+	}
+
+	err = sm.n.InstallSnapshot(snapshotData)
+	if err != nil {
+		panic(fmt.Sprintf("failed to snapshot: %s", err))
+	}
+	sm.blocksAppliedSinceSnapshot = 0
+}
+
+func (sm *raftChainStateMachine) loadSnapshot(data []byte) {
+	var snapshot chainHashSnapshot
+	err := json.Unmarshal(data, &snapshot)
+	if err != nil {
+		panic(fmt.Sprintf("failed to unmarshal snapshot: %s", err))
+	}
+
+	fmt.Printf("[%s] Applying snapshot from %s taken after %d blocks\n", sm.s.Name(), snapshot.SourceNode, snapshot.BlocksCount)
+	err = sm.hash.(encoding.BinaryUnmarshaler).UnmarshalBinary(snapshot.HashData)
+	if err != nil {
+		panic(fmt.Sprintf("failed to unmarshal hash data: %s", err))
+	}
+	sm.blocksApplied = snapshot.BlocksCount
+	sm.blocksAppliedSinceSnapshot = 0
 }
 
 // Factory function.
