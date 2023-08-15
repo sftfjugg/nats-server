@@ -136,5 +136,12 @@ func main() {
 		defer undo()
 	}
 
+	err = server.JoinRaftGroup(s, "foobar")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: failed to join raft group: %s\n", exe, err)
+		os.Exit(0)
+
+	}
+
 	s.WaitForShutdown()
 }

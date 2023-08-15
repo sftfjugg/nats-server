@@ -355,6 +355,7 @@ func (s *Server) startRaftNode(accName string, cfg *RaftConfig) (RaftNode, error
 	sq := s.sys.sq
 	sacc := s.sys.account
 	hash := s.sys.shash
+	fmt.Printf("🌸 RAFT Group %s ID: %s\n", cfg.Name, hash[:idLen])
 	pub := s.info.ID
 	s.mu.RUnlock()
 
