@@ -3,11 +3,13 @@ package server
 import (
 	"bytes"
 	"encoding"
-	"encoding/binary"
+	"encoding/gob"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -27,7 +29,13 @@ func JoinRaftGroup(s *Server, name string) error {
 			time.Sleep(1 * time.Second)
 			rng.Read(valueBuf)
 			valueString := fmt.Sprintf("%X", valueBuf)
-			sm.propose([]byte(valueString))
+			err := sm.propose([]byte(valueString))
+			if errors.Is(err, errNotLeader) {
+				// Backoff if not leader, no point in keep trying
+				time.Sleep(5 * time.Second)
+			} else if err != nil {
+				fmt.Printf("‼️ Propose error: %s", err)
+			}
 		}
 	}()
 	return nil
@@ -35,17 +43,23 @@ func JoinRaftGroup(s *Server, name string) error {
 
 type RaftChainStateMachine struct {
 	sync.Mutex
-	groupName               string
-	server                  *Server
-	raftNode                RaftNode
-	blockCount              uint64
-	hash                    hash.Hash32
-	blocksSinceLastSnapshot uint64
+	groupName                 string
+	server                    *Server
+	raftNode                  RaftNode
+	blockCount                uint64
+	hash                      hash.Hash32
+	blocksSinceLastSnapshot   uint64
+	currentCommitEntriesIndex uint64
 }
 
 func newRaftBlahChainStateMachine(name string, s *Server) (*RaftChainStateMachine, error) {
 
-	storeDir := filepath.Join(s.StoreDir(), globalAccountName, defaultStoreDirName, name)
+	var storeDir string
+	if s.StoreDir() != _EMPTY_ {
+		storeDir = filepath.Join(s.StoreDir(), globalAccountName, defaultStoreDirName, name)
+	} else {
+		storeDir = filepath.Join(os.TempDir(), "raft-test", s.Name(), globalAccountName, defaultStoreDirName, name)
+	}
 
 	fs, err := newFileStoreWithCreated(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMediumBlockSize, AsyncFlush: false, SyncInterval: 10 * time.Second},
@@ -63,7 +77,6 @@ func newRaftBlahChainStateMachine(name string, s *Server) (*RaftChainStateMachin
 
 	var bootstrap bool
 	if ps, err := readPeerState(storeDir); err != nil {
-		s.Noticef("JetStream cluster bootstrapping")
 		bootstrap = true
 		peers := s.ActivePeers()
 		s.Debugf("JetStream cluster initial peers: %+v", peers)
@@ -141,6 +154,13 @@ func (sm *RaftChainStateMachine) applyEntries(ce *CommittedEntry) {
 		return
 	}
 
+	if ce.Index <= sm.currentCommitEntriesIndex {
+		sm.log("Skip committed entries #%d, already applied", ce.Index)
+		return
+	}
+
+	sm.currentCommitEntriesIndex = ce.Index
+
 	sm.log(
 		"Applying committed entries batch #%d (%d sub-entries)",
 		ce.Index,
@@ -154,10 +174,13 @@ func (sm *RaftChainStateMachine) applyEntries(ce *CommittedEntry) {
 			sm.addPeer(string(entry.Data))
 		case EntryNormal:
 			sm.applyNext(ce.Index, entry.Data)
+		case EntrySnapshot:
+			sm.loadSnapshot(ce.Index, entry.Data)
 		default:
 			panic(fmt.Sprintf("unhandled entry type: %s", entry.Type))
 		}
 	}
+
 }
 
 func (sm *RaftChainStateMachine) leaderChange(leader bool) {
@@ -171,8 +194,10 @@ func (sm *RaftChainStateMachine) log(format string, v ...interface{}) {
 }
 
 type blockChainSnapshot struct {
-	HashData    []byte
-	BlocksCount uint64
+	HashData            []byte
+	BlocksCount         uint64
+	CurrentHash         string
+	CommittedEntryIndex uint64
 }
 
 func (sm *RaftChainStateMachine) snapshot() {
@@ -196,12 +221,14 @@ func (sm *RaftChainStateMachine) snapshot() {
 	}
 
 	snapshot := blockChainSnapshot{
-		HashData:    serializedHash,
-		BlocksCount: sm.blockCount,
+		HashData:            serializedHash,
+		BlocksCount:         sm.blockCount,
+		CurrentHash:         fmt.Sprintf("%X", sm.hash.Sum(nil)),
+		CommittedEntryIndex: sm.currentCommitEntriesIndex,
 	}
 
 	var snapshotBuf bytes.Buffer
-	err = binary.Write(&snapshotBuf, binary.BigEndian, &snapshot)
+	err = gob.NewEncoder(&snapshotBuf).Encode(&snapshot)
 	if err != nil {
 		panic(fmt.Sprintf("failed to serialize snapshot: %s", err))
 	}
@@ -212,15 +239,14 @@ func (sm *RaftChainStateMachine) snapshot() {
 	}
 
 	sm.blocksSinceLastSnapshot = 0
+
+	sm.log("Created snapshot: %+v", snapshot)
 }
 
-func (sm *RaftChainStateMachine) propose(bytes []byte) {
+func (sm *RaftChainStateMachine) propose(bytes []byte) error {
 	sm.Lock()
 	defer sm.Unlock()
-	err := sm.raftNode.Propose(bytes)
-	if err != nil {
-		sm.log("Propose error: %s", err)
-	}
+	return sm.raftNode.Propose(bytes)
 }
 
 // Lock held
@@ -233,14 +259,20 @@ func (sm *RaftChainStateMachine) addPeer(peerName string) {
 
 // Lock held
 func (sm *RaftChainStateMachine) applyNext(entryIndex uint64, data []byte) {
-	// Hash entry index
-	err := binary.Write(sm.hash, binary.BigEndian, entryIndex)
+
+	// Hash data by itself to obtain block hash
+	blockHash := crc32.NewIEEE()
+	written, err := blockHash.Write(data)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to hash entry index: %s", err))
+		panic(fmt.Sprintf("Failed to hash block data (by itself): %s", err))
+	} else if written != len(data) {
+		panic(fmt.Sprintf("Partially read block data: %d != %d", written, len(data)))
 	}
 
-	// Hash entry data
-	written, err := sm.hash.Write(data)
+	previousChainHash := sm.hash.Sum(nil)
+
+	// Hash data to obtain next chain hash
+	written, err = sm.hash.Write(data)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to hash block data: %s", err))
 	} else if written != len(data) {
@@ -250,5 +282,36 @@ func (sm *RaftChainStateMachine) applyNext(entryIndex uint64, data []byte) {
 	sm.blockCount += 1
 	sm.blocksSinceLastSnapshot += 1
 
-	sm.log("Hash after %d blocks: %X", sm.blockCount, sm.hash.Sum(nil))
+	sm.log(
+		"Ingested block %X chain hash after %d blocks: %X -> %X",
+		blockHash.Sum(nil),
+		sm.blockCount,
+		previousChainHash,
+		sm.hash.Sum(nil),
+	)
+}
+
+// Lock held
+func (sm *RaftChainStateMachine) loadSnapshot(entryIndex uint64, snapshotData []byte) {
+	snapshot := blockChainSnapshot{}
+	err := gob.NewDecoder(bytes.NewBuffer(snapshotData)).Decode(&snapshot)
+	if err != nil {
+		panic(fmt.Sprintf("failed to load snapshot: %s", err))
+	}
+
+	err = sm.hash.(encoding.BinaryUnmarshaler).UnmarshalBinary(snapshot.HashData)
+	if err != nil {
+		panic(fmt.Sprintf("failed to unmarshall hash in snapshot: %s", err))
+	}
+
+	currentHash := fmt.Sprintf("%X", sm.hash.Sum(nil))
+	if currentHash != snapshot.CurrentHash {
+		panic(fmt.Sprintf("Snapshot hash mismatch: %s != %s", currentHash, snapshot.CurrentHash))
+	}
+
+	sm.blockCount = snapshot.BlocksCount
+	sm.blocksSinceLastSnapshot = 0
+	sm.currentCommitEntriesIndex = snapshot.CommittedEntryIndex
+
+	sm.log("Installed snapshot: %+v", snapshot)
 }
