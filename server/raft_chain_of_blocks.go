@@ -15,8 +15,14 @@ import (
 	"time"
 )
 
-func JoinRaftGroup(s *Server, name string) error {
-	sm, err := newRaftBlahChainStateMachine(name, s)
+func JoinChainOfBlocksGroup(s *Server, name string) error {
+
+	observer, err := newChainOfBlocksObserver(name)
+	if err != nil {
+		return fmt.Errorf("failed to create observer for group %s: %w", name, err)
+	}
+
+	sm, err := newChainOfBlocksStateMachine(name, s, observer)
 	if err != nil {
 		return err
 	}
@@ -41,7 +47,7 @@ func JoinRaftGroup(s *Server, name string) error {
 	return nil
 }
 
-type RaftChainStateMachine struct {
+type ChainOfBlocksStateMachine struct {
 	sync.Mutex
 	groupName                 string
 	server                    *Server
@@ -50,9 +56,10 @@ type RaftChainStateMachine struct {
 	hash                      hash.Hash32
 	blocksSinceLastSnapshot   uint64
 	currentCommitEntriesIndex uint64
+	observer                  *chainOfBlocksObserver
 }
 
-func newRaftBlahChainStateMachine(name string, s *Server) (*RaftChainStateMachine, error) {
+func newChainOfBlocksStateMachine(name string, s *Server, observer *chainOfBlocksObserver) (*ChainOfBlocksStateMachine, error) {
 
 	var storeDir string
 	if s.StoreDir() != _EMPTY_ {
@@ -103,12 +110,13 @@ func newRaftBlahChainStateMachine(name string, s *Server) (*RaftChainStateMachin
 		}
 	}
 
-	sm := &RaftChainStateMachine{
+	sm := &ChainOfBlocksStateMachine{
 		groupName:  name,
 		server:     s,
 		raftNode:   n,
 		blockCount: 0,
 		hash:       crc32.NewIEEE(),
+		observer:   observer,
 	}
 
 	sm.log("Start raft SM for group %s (storeDir: %s)", name, storeDir)
@@ -118,16 +126,16 @@ func newRaftBlahChainStateMachine(name string, s *Server) (*RaftChainStateMachin
 	return sm, nil
 }
 
-func (sm *RaftChainStateMachine) runLoop() {
+func (sm *ChainOfBlocksStateMachine) runLoop() {
+	sm.observer.starting(sm.server.Name(), sm.raftNode.ID())
+	defer sm.observer.stopped()
+
 	qch, lch, aq := sm.raftNode.QuitC(), sm.raftNode.LeadChangeC(), sm.raftNode.ApplyQ()
 
 	snapshotTicker := time.NewTicker(15 * time.Second)
 
 	for {
 		select {
-		case <-sm.server.quitCh:
-			sm.log("Shutting down")
-			return
 		case <-qch:
 			return
 		case <-aq.ch:
@@ -145,7 +153,7 @@ func (sm *RaftChainStateMachine) runLoop() {
 	}
 }
 
-func (sm *RaftChainStateMachine) applyEntries(ce *CommittedEntry) {
+func (sm *ChainOfBlocksStateMachine) applyEntries(ce *CommittedEntry) {
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -173,7 +181,7 @@ func (sm *RaftChainStateMachine) applyEntries(ce *CommittedEntry) {
 		case EntryAddPeer:
 			sm.addPeer(string(entry.Data))
 		case EntryNormal:
-			sm.applyNext(ce.Index, entry.Data)
+			sm.applyBlock(ce.Index, entry.Data)
 		case EntrySnapshot:
 			sm.loadSnapshot(ce.Index, entry.Data)
 		default:
@@ -183,13 +191,13 @@ func (sm *RaftChainStateMachine) applyEntries(ce *CommittedEntry) {
 
 }
 
-func (sm *RaftChainStateMachine) leaderChange(leader bool) {
+func (sm *ChainOfBlocksStateMachine) leaderChange(leader bool) {
 	sm.Lock()
 	defer sm.Unlock()
 	sm.log("Leader change (self? %v)", leader)
 }
 
-func (sm *RaftChainStateMachine) log(format string, v ...interface{}) {
+func (sm *ChainOfBlocksStateMachine) log(format string, v ...interface{}) {
 	sm.server.Logger().Noticef("🌼 "+format, v...)
 }
 
@@ -200,7 +208,7 @@ type blockChainSnapshot struct {
 	CommittedEntryIndex uint64
 }
 
-func (sm *RaftChainStateMachine) snapshot() {
+func (sm *ChainOfBlocksStateMachine) snapshot() {
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -243,14 +251,14 @@ func (sm *RaftChainStateMachine) snapshot() {
 	sm.log("Created snapshot: %+v", snapshot)
 }
 
-func (sm *RaftChainStateMachine) propose(bytes []byte) error {
+func (sm *ChainOfBlocksStateMachine) propose(bytes []byte) error {
 	sm.Lock()
 	defer sm.Unlock()
 	return sm.raftNode.Propose(bytes)
 }
 
 // Lock held
-func (sm *RaftChainStateMachine) addPeer(peerName string) {
+func (sm *ChainOfBlocksStateMachine) addPeer(peerName string) {
 	sm.log("Add peer: %s", peerName)
 	sm.server.mu.RLock()
 	defer sm.server.mu.RUnlock()
@@ -258,7 +266,7 @@ func (sm *RaftChainStateMachine) addPeer(peerName string) {
 }
 
 // Lock held
-func (sm *RaftChainStateMachine) applyNext(entryIndex uint64, data []byte) {
+func (sm *ChainOfBlocksStateMachine) applyBlock(entryIndex uint64, data []byte) {
 
 	// Hash data by itself to obtain block hash
 	blockHash := crc32.NewIEEE()
@@ -268,6 +276,7 @@ func (sm *RaftChainStateMachine) applyNext(entryIndex uint64, data []byte) {
 	} else if written != len(data) {
 		panic(fmt.Sprintf("Partially read block data: %d != %d", written, len(data)))
 	}
+	blockChecksum := blockHash.Sum(nil)
 
 	previousChainHash := sm.hash.Sum(nil)
 
@@ -279,20 +288,24 @@ func (sm *RaftChainStateMachine) applyNext(entryIndex uint64, data []byte) {
 		panic(fmt.Sprintf("Partially read block data: %d != %d", written, len(data)))
 	}
 
+	currentChainHash := sm.hash.Sum(nil)
+
 	sm.blockCount += 1
 	sm.blocksSinceLastSnapshot += 1
 
 	sm.log(
 		"Ingested block %X chain hash after %d blocks: %X -> %X",
-		blockHash.Sum(nil),
+		blockChecksum,
 		sm.blockCount,
 		previousChainHash,
-		sm.hash.Sum(nil),
+		currentChainHash,
 	)
+
+	sm.observer.appliedBlock(entryIndex, sm.blockCount, blockChecksum, previousChainHash, currentChainHash)
 }
 
 // Lock held
-func (sm *RaftChainStateMachine) loadSnapshot(entryIndex uint64, snapshotData []byte) {
+func (sm *ChainOfBlocksStateMachine) loadSnapshot(entryIndex uint64, snapshotData []byte) {
 	snapshot := blockChainSnapshot{}
 	err := gob.NewDecoder(bytes.NewBuffer(snapshotData)).Decode(&snapshot)
 	if err != nil {
