@@ -134,7 +134,6 @@ func (o *chainOfBlocksObserver) publishLoop() {
 				fmt.Printf("error publishing batch: %s\n", err)
 			} else if errors.Is(err, nats.ErrNoResponders) {
 				fmt.Printf("%s: %s\n", pubSubj, err)
-				time.Sleep(3 * time.Second)
 			} else if bytes.Compare(response.Data, []byte("ok")) != 0 {
 				fmt.Printf("unexpected server response: %s\n", response.Data)
 			} else {
@@ -146,10 +145,12 @@ func (o *chainOfBlocksObserver) publishLoop() {
 		}
 	}
 
-	select {
-	//TODO handle quit
-	case batch := <-o.publishCh:
-		publish(batch)
+	for {
+		select {
+		//TODO handle quit
+		case batch := <-o.publishCh:
+			publish(batch)
+		}
 	}
 }
 
