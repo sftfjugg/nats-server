@@ -206,6 +206,7 @@ type blockChainSnapshot struct {
 	BlocksCount         uint64
 	CurrentHash         string
 	CommittedEntryIndex uint64
+	CreatedBy           string
 }
 
 func (sm *ChainOfBlocksStateMachine) snapshot() {
@@ -233,6 +234,7 @@ func (sm *ChainOfBlocksStateMachine) snapshot() {
 		BlocksCount:         sm.blockCount,
 		CurrentHash:         fmt.Sprintf("%X", sm.hash.Sum(nil)),
 		CommittedEntryIndex: sm.currentCommitEntriesIndex,
+		CreatedBy:           fmt.Sprintf("%s/%s", sm.server.Name(), sm.raftNode.ID()),
 	}
 
 	var snapshotBuf bytes.Buffer
@@ -327,4 +329,7 @@ func (sm *ChainOfBlocksStateMachine) loadSnapshot(entryIndex uint64, snapshotDat
 	sm.currentCommitEntriesIndex = snapshot.CommittedEntryIndex
 
 	sm.log("Installed snapshot: %+v", snapshot)
+
+	sm.observer.appliedSnapshot(snapshot.CommittedEntryIndex, snapshot.BlocksCount, snapshot.CurrentHash, snapshot.CreatedBy)
+
 }

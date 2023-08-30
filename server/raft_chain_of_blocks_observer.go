@@ -56,6 +56,8 @@ func (o *chainOfBlocksObserver) appliedBlock(ceIndex, blockIndex uint64, blockCh
 		panic("was never started")
 	}
 
+	fmt.Printf("✨ apply block %d, block hash: %X chain hash: %X\n", blockIndex, blockChecksum, newChainHash)
+
 	e := &ApplyBlockEvent{
 		CEIndex:           ceIndex,
 		BlockIndex:        blockIndex,
@@ -72,6 +74,10 @@ func (o *chainOfBlocksObserver) appliedBlock(ceIndex, blockIndex uint64, blockCh
 	}
 }
 
+func (o *chainOfBlocksObserver) appliedSnapshot(committedEntryIndex, blocksCount uint64, currentHash string, createdBy string) {
+	fmt.Printf("✨ apply snapshot at block %d: chain hash: %s (from: %s)\n", blocksCount, currentHash, createdBy)
+}
+
 func (o *chainOfBlocksObserver) runLoop() {
 
 	var currentBatch *BlockEventsBatch
@@ -85,7 +91,7 @@ func (o *chainOfBlocksObserver) runLoop() {
 			}
 		}
 		currentBatch.BlockEvents = append(currentBatch.BlockEvents, e)
-		fmt.Printf("✨ appended event (batch size: %d)\n", len(currentBatch.BlockEvents))
+		//fmt.Printf("✨ appended event (batch size: %d)\n", len(currentBatch.BlockEvents))
 
 	}
 
@@ -93,7 +99,7 @@ func (o *chainOfBlocksObserver) runLoop() {
 		if currentBatch != nil {
 			select {
 			case o.publishCh <- currentBatch:
-				fmt.Printf("✅ Batch flushed\n")
+				//fmt.Printf("✅ Batch flushed\n")
 			default:
 				fmt.Printf("⚠️ Block batch dropped, channel full\n")
 			}
@@ -138,7 +144,7 @@ func (o *chainOfBlocksObserver) publishLoop() {
 				fmt.Printf("unexpected server response: %s\n", response.Data)
 			} else {
 				// Success
-				fmt.Printf("✅ Batch acknowledged\n")
+				//fmt.Printf("✅ Batch acknowledged\n")
 				break
 			}
 			time.Sleep(3 * time.Second)
