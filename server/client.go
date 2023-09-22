@@ -4097,10 +4097,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	var checkJS bool
 	shouldReturn := si.invalid || acc.sl == nil
 	if !shouldReturn && !isResponse && si.to == jsAllAPI {
-		subj := string(c.pa.subject)
-		if strings.HasPrefix(subj, jsRequestNextPre) || strings.HasPrefix(subj, jsDirectGetPre) {
-			checkJS = true
-		}
+		checkJS = strings.HasPrefix(string(c.pa.subject), jsRequestNextPre) || strings.HasPrefix(string(c.pa.subject), jsDirectGetPre)
 	}
 	siAcc := si.acc
 	acc.mu.RUnlock()
@@ -4294,6 +4291,14 @@ func (c *client) addSubToRouteTargets(sub *subscription) {
 		c.in.rts = make([]routeTarget, 0, routeTargetInit)
 	}
 
+	// If we are processing a leafnode sub, we want to make sure we only send to the remote cluster once.
+	// This is possible if a larger cluster is soliciting to us, so we may have multiple connections from same cluster.
+	var leafCluster string
+	if sub.client.kind == LEAF && sub.client.leaf != nil {
+		leafCluster = sub.client.leaf.remoteCluster
+	}
+
+	// Suppress sending multiples to same client.
 	for i := range c.in.rts {
 		rt := &c.in.rts[i]
 		if rt.sub.client == sub.client {
@@ -4302,6 +4307,12 @@ func (c *client) addSubToRouteTargets(sub *subscription) {
 				rt.qs = append(rt.qs, ' ')
 			}
 			return
+		}
+		if leafCluster != _EMPTY_ && rt.sub.client.kind == LEAF && leafCluster == rt.sub.client.leaf.remoteCluster {
+			// Don't suppress NRG traffic. For when we extend a JS domain via shared system account.
+			if !strings.HasPrefix(string(sub.subject), raftPrefix) {
+				return
+			}
 		}
 	}
 

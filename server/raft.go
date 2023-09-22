@@ -1574,6 +1574,7 @@ func (n *raft) Wipe() {
 }
 
 const (
+	raftPrefix         = "$NRG."
 	raftAllSubj        = "$NRG.>"
 	raftVoteSubj       = "$NRG.V.%s"
 	raftAppendSubj     = "$NRG.AE.%s"

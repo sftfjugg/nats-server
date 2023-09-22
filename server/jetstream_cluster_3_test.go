@@ -1920,7 +1920,7 @@ func TestJetStreamClusterLeafnodeDuplicateConsumerMessages(t *testing.T) {
 	require_NoError(t, err)
 
 	// Make sure stream leader is on S-1
-	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
 		si, err := ljs.StreamInfo("TEST")
 		require_NoError(t, err)
 		if si.Cluster.Leader == "A-S-1" {
@@ -1943,7 +1943,7 @@ func TestJetStreamClusterLeafnodeDuplicateConsumerMessages(t *testing.T) {
 	require_NoError(t, err)
 
 	// Make sure consumer leader is on S-2
-	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
 		ci, err := ljs.ConsumerInfo("TEST", "dlc")
 		require_NoError(t, err)
 		if ci.Cluster.Leader == "A-S-2" {
@@ -1983,19 +1983,19 @@ func TestJetStreamClusterLeafnodeDuplicateConsumerMessages(t *testing.T) {
 	// Make sure we can properly get messages.
 	msgs, err := sub1.Fetch(1)
 	require_NoError(t, err)
-	require_True(t, len(msgs) == 1)
-	require_True(t, string(msgs[0].Data) == "M-1")
+	require_Equal(t, len(msgs), 1)
+	require_Equal(t, string(msgs[0].Data), "M-1")
 
 	msgs, err = sub2.Fetch(1)
 	require_NoError(t, err)
-	require_True(t, len(msgs) == 1)
-	require_True(t, string(msgs[0].Data) == "M-2")
+	require_Equal(t, len(msgs), 1)
+	require_Equal(t, string(msgs[0].Data), "M-2")
 
 	// Make sure delivered state makes it to other server to not accidentally send M-2 again
 	// and fail the test below.
 	time.Sleep(250 * time.Millisecond)
 
-	// Now let's introduce and event, where A-S-2 will now reconnect after a restart to B-S-2
+	// Now let's introduce an event, where A-S-2 will now reconnect after a restart to B-S-2
 	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
 		ls := lc.servers[1]
 		wantedRemote := "S-1"
@@ -2027,21 +2027,25 @@ func TestJetStreamClusterLeafnodeDuplicateConsumerMessages(t *testing.T) {
 	sendStreamMsg(t, lnc, "foo", "M-3")
 	sendStreamMsg(t, lnc, "foo", "M-4")
 
+	time.Sleep(250 * time.Millisecond)
+
 	msgs, err = sub1.Fetch(2)
 	require_NoError(t, err)
-	require_True(t, len(msgs) == 2)
-	require_True(t, string(msgs[0].Data) == "M-3")
-	require_True(t, string(msgs[1].Data) == "M-4")
+	require_Equal(t, len(msgs), 2)
+	require_Equal(t, string(msgs[0].Data), "M-3")
+	require_Equal(t, string(msgs[1].Data), "M-4")
 
 	// Send 2 more messages.
 	sendStreamMsg(t, lnc, "foo", "M-5")
 	sendStreamMsg(t, lnc, "foo", "M-6")
 
+	time.Sleep(250 * time.Millisecond)
+
 	msgs, err = sub2.Fetch(2)
 	require_NoError(t, err)
-	require_True(t, len(msgs) == 2)
-	require_True(t, string(msgs[0].Data) == "M-5")
-	require_True(t, string(msgs[1].Data) == "M-6")
+	require_Equal(t, len(msgs), 2)
+	require_Equal(t, string(msgs[0].Data), "M-5")
+	require_Equal(t, string(msgs[1].Data), "M-6")
 }
 
 func snapRGSet(pFlag bool, banner string, osi *nats.StreamInfo) *map[string]struct{} {
